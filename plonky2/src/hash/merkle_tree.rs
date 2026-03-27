@@ -798,6 +798,11 @@ impl<F: RichField, H: Hasher<F>> MerkleTree<F, H> {
         v
     }
 
+    /// Contiguous leaf buffer in Merkle order (`get_leaves_count() * leaf_size` scalars).
+    pub fn leaves_flat(&self) -> &[F] {
+        &self.leaves
+    }
+
     pub fn get_leaves_1d(&self) -> Vec<F> {
         self.leaves.clone()
     }

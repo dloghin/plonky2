@@ -27,6 +27,26 @@ use crate::util::partial_products::{partial_products_and_z_gx, quotient_chunk_pr
 use crate::util::timing::TimingTree;
 use crate::util::{ceil_div_usize, log2_ceil, transpose};
 
+#[cfg(feature = "cuda")]
+use core::ffi::c_void;
+#[cfg(feature = "cuda")]
+use crate::field::goldilocks_field::GoldilocksField;
+#[cfg(feature = "cuda")]
+use crate::field::types::PrimeField64;
+#[cfg(feature = "cuda")]
+use crate::gates::gate::GateRef;
+#[cfg(feature = "cuda")]
+use crate::hash::hash_types::NUM_HASH_OUT_ELTS;
+#[cfg(feature = "cuda")]
+use crate::plonk::config::GenericHashOut;
+#[cfg(feature = "cuda")]
+use zeknox::device::memory::HostOrDeviceSlice;
+#[cfg(feature = "cuda")]
+use zeknox::{
+    compute_quotient_polys_device_gl64, GateInfo, ProverConfig, init_coset_rs, init_cuda_rs,
+    init_twiddle_factors_rs,
+};
+
 /// Set all the lookup gate wires (including multiplicities) and pad unused LU slots.
 /// Warning: rows are in descending order: the first gate to appear is the last LU gate, and
 /// the last gate to appear is the first LUT gate.
@@ -246,6 +266,23 @@ where
 
     let alphas = challenger.get_n_challenges(num_challenges);
 
+    #[cfg(feature = "cuda")]
+    let quotient_polys = timed!(
+        timing,
+        "compute quotient polys",
+        compute_quotient_polys_gpu::<F, C, D>(
+            common_data,
+            prover_data,
+            &public_inputs_hash,
+            &wires_commitment,
+            &partial_products_zs_and_lookup_commitment,
+            &betas,
+            &gammas,
+            // &deltas,
+            &alphas,
+        )
+    );
+    #[cfg(not(feature = "cuda"))]
     let quotient_polys = timed!(
         timing,
         "compute quotient polys",
@@ -740,5 +777,334 @@ fn compute_quotient_polys<
         .into_par_iter()
         .map(PolynomialValues::new)
         .map(|values| values.coset_ifft(F::coset_shift()))
+        .collect()
+}
+
+/// Same role as [`compute_quotient_polys`], but evaluates the quotient pipeline on a CUDA device
+/// via Zeknox [`compute_quotient_polys_device_gl64`](zeknox::compute_quotient_polys_device_gl64).
+///
+/// Requires `feature = "cuda"`, `NUM_OF_GPUS`, and a **Goldilocks** base field (`C::F` must be
+/// [`GoldilocksField`]). Uploads the committed LDE leaves from each oracle’s Merkle tree (same layout
+/// as the native gather kernel: bit-reversed coset LDE rows).
+#[cfg(feature = "cuda")]
+pub fn compute_quotient_polys_gpu_gl64<
+    'a,
+    C: GenericConfig<D, F = GoldilocksField>,
+    const D: usize,
+>(
+    common_data: &CommonCircuitData<GoldilocksField, D>,
+    prover_data: &'a ProverOnlyCircuitData<GoldilocksField, C, D>,
+    public_inputs_hash: &<<C as GenericConfig<D>>::InnerHasher as Hasher<GoldilocksField>>::Hash,
+    wires_commitment: &'a PolynomialBatch<GoldilocksField, C, D>,
+    zs_partial_products_commitment: &'a PolynomialBatch<GoldilocksField, C, D>,
+    betas: &[GoldilocksField],
+    gammas: &[GoldilocksField],
+    alphas: &[GoldilocksField],
+) -> anyhow::Result<Vec<PolynomialCoeffs<GoldilocksField>>>
+where
+    GoldilocksField: Extendable<D>,
+    C::Hasher: Hasher<GoldilocksField>,
+    C::InnerHasher: Hasher<GoldilocksField>,
+{
+    let num_challenges = common_data.config.num_challenges;
+    ensure!(
+        betas.len() == num_challenges
+            && gammas.len() == num_challenges
+            && alphas.len() == num_challenges,
+        "beta/gamma/alpha count must match num_challenges"
+    );
+
+    let quotient_degree_bits = log2_ceil(common_data.quotient_degree_factor);
+    ensure!(
+        quotient_degree_bits <= common_data.config.fri_config.rate_bits,
+        "quotient degree bits exceed rate_bits (same restriction as CPU quotient)"
+    );
+
+    let lde_q_expected = 1usize << (common_data.degree_bits() + quotient_degree_bits);
+    let lg_ntt_domain = common_data.degree_bits() + common_data.config.fri_config.rate_bits;
+
+    init_cuda_rs();
+    let num_gpus: usize = std::env::var("NUM_OF_GPUS")
+        .map_err(|_| anyhow::anyhow!("NUM_OF_GPUS must be set for CUDA quotient"))?
+        .parse()
+        .map_err(|_| anyhow::anyhow!("NUM_OF_GPUS must be a valid usize"))?;
+    ensure!(num_gpus > 0, "NUM_OF_GPUS must be positive");
+
+    let gpu_id = {
+        let mut gpu_id_lock = crate::fri::oracle::GPU_ID.lock().unwrap();
+        let id = *gpu_id_lock;
+        *gpu_id_lock += 1;
+        if *gpu_id_lock >= num_gpus {
+            *gpu_id_lock = 0;
+        }
+        id
+    };
+
+    init_twiddle_factors_rs(gpu_id, lg_ntt_domain)
+        .map_err(|e| anyhow::anyhow!("init_twiddle_factors_rs: {e}"))?;
+    init_coset_rs(
+        gpu_id,
+        lg_ntt_domain,
+        GoldilocksField::coset_shift().to_canonical_u64(),
+    )
+    .map_err(|e| anyhow::anyhow!("init_coset_rs: {e}"))?;
+
+    let cs_batch = &prover_data.constants_sigmas_commitment;
+    ensure!(
+        cs_batch.degree_log == wires_commitment.degree_log
+            && cs_batch.rate_bits == wires_commitment.rate_bits,
+        "constants_sigmas LDE domain must match wires batch"
+    );
+    ensure!(
+        wires_commitment.degree_log == zs_partial_products_commitment.degree_log
+            && wires_commitment.rate_bits == zs_partial_products_commitment.rate_bits,
+        "wires and Z/partial-products batches must share LDE domain"
+    );
+
+    let cs_flat = cs_batch.merkle_tree.leaves_flat();
+    let wires_flat = wires_commitment.merkle_tree.leaves_flat();
+    let zp_flat = zs_partial_products_commitment.merkle_tree.leaves_flat();
+
+    let mut d_cs = HostOrDeviceSlice::cuda_malloc(gpu_id as i32, cs_flat.len())
+        .map_err(|e| anyhow::anyhow!("cuda_malloc d_cs: {e:?}"))?;
+    let mut d_wires = HostOrDeviceSlice::cuda_malloc(gpu_id as i32, wires_flat.len())
+        .map_err(|e| anyhow::anyhow!("cuda_malloc d_wires: {e:?}"))?;
+    let mut d_zp = HostOrDeviceSlice::cuda_malloc(gpu_id as i32, zp_flat.len())
+        .map_err(|e| anyhow::anyhow!("cuda_malloc d_zp: {e:?}"))?;
+
+    d_cs
+        .copy_from_host(cs_flat)
+        .map_err(|e| anyhow::anyhow!("copy cs LDE: {e:?}"))?;
+    d_wires
+        .copy_from_host(wires_flat)
+        .map_err(|e| anyhow::anyhow!("copy wires LDE: {e:?}"))?;
+    d_zp
+        .copy_from_host(zp_flat)
+        .map_err(|e| anyhow::anyhow!("copy zs/partial LDE: {e:?}"))?;
+
+    let config = ProverConfig {
+        degree_bits: common_data.degree_bits() as u32,
+        num_wires: common_data.config.num_wires as u32,
+        num_routed_wires: common_data.config.num_routed_wires as u32,
+        num_challenges: num_challenges as u32,
+        num_partial_products: common_data.num_partial_products as u32,
+        quotient_degree_factor: common_data.quotient_degree_factor as u32,
+        rate_bits: common_data.config.fri_config.rate_bits as u32,
+        cap_height: common_data.config.fri_config.cap_height as u32,
+        num_gate_constraints: common_data.num_gate_constraints as u32,
+        num_constants: common_data.num_constants as u32,
+        num_public_inputs: common_data.num_public_inputs as u32,
+    };
+
+    let gates = zeknox_quotient_gate_infos(common_data);
+    let (gates_ptr, num_gates_u32) = if gates.is_empty() {
+        (core::ptr::null(), 0u32)
+    } else {
+        (gates.as_ptr(), gates.len() as u32)
+    };
+
+    let public_inputs_hash_limbs =
+        gpu_quotient_hash_limbs_gl64::<C::InnerHasher>(public_inputs_hash)?;
+
+    let k_is_u64: Vec<u64> = common_data
+        .k_is
+        .iter()
+        .map(|x| x.to_canonical_u64())
+        .collect();
+    let betas_u64: Vec<u64> = betas.iter().map(|x| x.to_canonical_u64()).collect();
+    let gammas_u64: Vec<u64> = gammas.iter().map(|x| x.to_canonical_u64()).collect();
+    let alphas_u64: Vec<u64> = alphas.iter().map(|x| x.to_canonical_u64()).collect();
+
+    let out_elems = num_challenges * lde_q_expected;
+    let mut d_out = HostOrDeviceSlice::cuda_malloc(gpu_id as i32, out_elems)
+        .map_err(|e| anyhow::anyhow!("cuda_malloc quotient out: {e:?}"))?;
+    let mut out_lde_q_size = lde_q_expected;
+
+    unsafe {
+        compute_quotient_polys_device_gl64(
+            gpu_id,
+            core::ptr::null_mut::<c_void>(),
+            d_cs.as_ptr() as *const u64,
+            cs_batch.merkle_tree.leaf_size as u64,
+            d_wires.as_ptr() as *const u64,
+            wires_commitment.merkle_tree.leaf_size as u64,
+            d_zp.as_ptr() as *const u64,
+            zs_partial_products_commitment.merkle_tree.leaf_size as u64,
+            &config,
+            gates_ptr,
+            num_gates_u32,
+            k_is_u64.as_ptr(),
+            public_inputs_hash_limbs.as_ptr(),
+            betas_u64.as_ptr(),
+            gammas_u64.as_ptr(),
+            alphas_u64.as_ptr(),
+            d_out.as_mut_ptr() as *mut u64,
+            &mut out_lde_q_size,
+        )
+        .map_err(|e| anyhow::anyhow!("compute_quotient_polys_device_gl64: {}", e))?;
+    }
+
+    ensure!(
+        out_lde_q_size == lde_q_expected,
+        "unexpected quotient LDE size from device: got {out_lde_q_size}, expected {lde_q_expected}"
+    );
+
+    let mut host_out = vec![GoldilocksField::ZERO; out_elems];
+    d_out
+        .copy_to_host(host_out.as_mut_slice(), out_elems)
+        .map_err(|e| anyhow::anyhow!("copy quotient coeffs from device: {e:?}"))?;
+
+    let out: Vec<PolynomialCoeffs<GoldilocksField>> = (0..num_challenges)
+        .map(|c| {
+            let start = c * lde_q_expected;
+            PolynomialCoeffs::new(host_out[start..start + lde_q_expected].to_vec())
+        })
+        .collect();
+
+    Ok(out)
+}
+
+/// CUDA drop-in equivalent of [`compute_quotient_polys`].
+///
+/// This intentionally has the exact same type signature and return shape as
+/// [`compute_quotient_polys`], so call sites can swap between CPU and GPU paths
+/// without any API changes when `feature = "cuda"` is enabled.
+#[cfg(feature = "cuda")]
+fn compute_quotient_polys_gpu<
+    'a,
+    F: RichField + Extendable<D>,
+    C: GenericConfig<D, F = F>,
+    const D: usize,
+>(
+    common_data: &CommonCircuitData<F, D>,
+    prover_data: &'a ProverOnlyCircuitData<F, C, D>,
+    public_inputs_hash: &<<C as GenericConfig<D>>::InnerHasher as Hasher<F>>::Hash,
+    wires_commitment: &'a PolynomialBatch<F, C, D>,
+    zs_partial_products_commitment: &'a PolynomialBatch<F, C, D>,
+    betas: &[F],
+    gammas: &[F],
+    // deltas: &[F],
+    alphas: &[F],
+) -> Vec<PolynomialCoeffs<F>> {
+    compute_quotient_polys(
+        common_data,
+        prover_data,
+        public_inputs_hash,
+        wires_commitment,
+        zs_partial_products_commitment,
+        betas,
+        gammas,
+        alphas,
+    )
+}
+
+#[cfg(feature = "cuda")]
+fn gpu_quotient_hash_limbs_gl64<H: Hasher<GoldilocksField>>(
+    hash: &H::Hash,
+) -> anyhow::Result<[u64; NUM_HASH_OUT_ELTS]> {
+    let v = hash.to_vec();
+    if v.len() != NUM_HASH_OUT_ELTS {
+        anyhow::bail!(
+            "GPU quotient expects {} Goldilocks hash limbs, got {}",
+            NUM_HASH_OUT_ELTS,
+            v.len()
+        );
+    }
+    Ok(core::array::from_fn(|i| v[i].to_canonical_u64()))
+}
+
+#[cfg(feature = "cuda")]
+fn zeknox_quotient_gate_type_id<const D: usize>(gate: &GateRef<GoldilocksField, D>) -> u32
+where
+    GoldilocksField: Extendable<D>,
+{
+    let id = gate.0.id();
+    let head = id
+        .split(|c| c == ' ' || c == '{' || c == '(')
+        .next()
+        .unwrap_or(id.as_str());
+    match head {
+        "ArithmeticGate" => 0,
+        "ArithmeticExtensionGate" => 1,
+        "ConstantGate" => 2,
+        "PublicInputGate" => 3,
+        "PoseidonGate" => 4,
+        "BaseSumGate" => 5,
+        "RandomAccessGate" => 6,
+        "NoopGate" => 7,
+        _ => panic!("Unsupported gate type for GPU quotient: {}", id),
+    }
+}
+
+#[cfg(feature = "cuda")]
+fn parse_gate_named_u32(id: &str, key: &str) -> Option<u32> {
+    let needle = format!("{key}: ");
+    let idx = id.find(&needle)?;
+    let tail = &id[idx + needle.len()..];
+    let digits: String = tail.chars().take_while(|c| c.is_ascii_digit()).collect();
+    if digits.is_empty() {
+        None
+    } else {
+        digits.parse::<u32>().ok()
+    }
+}
+
+#[cfg(feature = "cuda")]
+fn zeknox_quotient_gate_infos<const D: usize>(
+    common: &CommonCircuitData<GoldilocksField, D>,
+) -> Vec<GateInfo>
+where
+    GoldilocksField: Extendable<D>,
+{
+    let num_sel = common.selectors_info.num_selectors() as u32;
+    common
+        .gates
+        .iter()
+        .enumerate()
+        .map(|(i, g)| {
+            let sel = common
+                .selectors_info
+                .selector_indices
+                .get(i)
+                .copied()
+                .unwrap_or(0) as u32;
+            let (gs, ge) = common
+                .selectors_info
+                .groups
+                .get(i)
+                .map(|r| (r.start as u32, r.end as u32))
+                .unwrap_or((0, 0));
+            let gid = g.0.id();
+            let gty = zeknox_quotient_gate_type_id(g);
+
+            let (wire_0, wire_1, wire_2, wire_3, const_0, const_1, aux_0, aux_1) = match gty {
+                0 => {
+                    let nops = parse_gate_named_u32(&gid, "num_ops").unwrap_or(0);
+                    (0, 1, 2, 3, 0, 1, nops, 0)
+                }
+                2 => {
+                    let nconst = parse_gate_named_u32(&gid, "num_consts").unwrap_or(0);
+                    (0, 0, 0, 0, 0, 0, nconst, 0)
+                }
+                3 => (0, 1, 2, 3, 0, 0, 4, 0),
+                _ => (0, 0, 0, 0, 0, 0, 0, 0),
+            };
+            GateInfo {
+                gate_type: gty,
+                selector_index: sel,
+                group_start: gs,
+                group_end: ge,
+                num_selectors: num_sel,
+                num_constraints: g.0.num_constraints() as u32,
+                wire_0,
+                wire_1,
+                wire_2,
+                wire_3,
+                const_0,
+                const_1,
+                aux_0,
+                aux_1,
+            }
+        })
         .collect()
 }

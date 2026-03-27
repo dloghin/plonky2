@@ -4,7 +4,7 @@ pub fn init_cuda() {
     use plonky2_field::types::{Field, PrimeField64};
     use zeknox::{get_number_of_gpus_rs, init_coset_rs, init_twiddle_factors_rs};
 
-    let num_of_gpus = get_number_of_gpus_rs();
+    let num_of_gpus = get_number_of_gpus_rs().expect("get_number_of_gpus_rs");
     println!("num of gpus: {:?}", num_of_gpus);
     std::env::set_var("NUM_OF_GPUS", num_of_gpus.to_string());
 
