@@ -7,7 +7,11 @@ use core::ffi::c_void;
 use core::mem::swap;
 
 use anyhow::{ensure, Result};
+#[cfg(feature = "cuda")]
+use once_cell::sync::Lazy;
 use plonky2_maybe_rayon::*;
+#[cfg(feature = "cuda")]
+use std::sync::Mutex;
 #[cfg(feature = "cuda")]
 use zeknox::device::memory::HostOrDeviceSlice;
 #[cfg(feature = "cuda")]
@@ -44,6 +48,34 @@ use crate::timed;
 use crate::util::partial_products::{partial_products_and_z_gx, quotient_chunk_products};
 use crate::util::timing::TimingTree;
 use crate::util::{ceil_div_usize, log2_ceil, transpose};
+
+#[cfg(feature = "cuda")]
+#[derive(Debug)]
+struct QuotientGpuCache {
+    gpu_id: usize,
+    common_ptr: usize,
+    cs_ptr: usize,
+    cs_len: usize,
+    wires_ptr: usize,
+    wires_len: usize,
+    zp_ptr: usize,
+    zp_len: usize,
+    d_cs: HostOrDeviceSlice<'static, GoldilocksField>,
+    d_wires: HostOrDeviceSlice<'static, GoldilocksField>,
+    d_zp: HostOrDeviceSlice<'static, GoldilocksField>,
+    d_out: HostOrDeviceSlice<'static, GoldilocksField>,
+    host_out: Vec<GoldilocksField>,
+    gates: Vec<GateInfo>,
+    num_gates_u32: u32,
+    k_is_u64: Vec<u64>,
+    betas_u64: Vec<u64>,
+    gammas_u64: Vec<u64>,
+    alphas_u64: Vec<u64>,
+    out_elems: usize,
+}
+
+#[cfg(feature = "cuda")]
+static QUOTIENT_GPU_CACHE: Lazy<Mutex<Option<QuotientGpuCache>>> = Lazy::new(|| Mutex::new(None));
 
 /// Set all the lookup gate wires (including multiplicities) and pad unused LU slots.
 /// Warning: rows are in descending order: the first gate to appear is the last LU gate, and
@@ -997,21 +1029,96 @@ where
     let cs_flat = cs_batch.merkle_tree.leaves_flat();
     let wires_flat = wires_commitment.merkle_tree.leaves_flat();
     let zp_flat = zs_partial_products_commitment.merkle_tree.leaves_flat();
+    let out_elems = num_challenges * lde_q_expected;
 
-    let mut d_cs = HostOrDeviceSlice::cuda_malloc(gpu_id as i32, cs_flat.len())
-        .map_err(|e| anyhow::anyhow!("cuda_malloc d_cs: {e:?}"))?;
-    let mut d_wires = HostOrDeviceSlice::cuda_malloc(gpu_id as i32, wires_flat.len())
-        .map_err(|e| anyhow::anyhow!("cuda_malloc d_wires: {e:?}"))?;
-    let mut d_zp = HostOrDeviceSlice::cuda_malloc(gpu_id as i32, zp_flat.len())
-        .map_err(|e| anyhow::anyhow!("cuda_malloc d_zp: {e:?}"))?;
+    let cs_ptr = cs_flat.as_ptr() as usize;
+    let wires_ptr = wires_flat.as_ptr() as usize;
+    let zp_ptr = zp_flat.as_ptr() as usize;
+    let common_ptr = common_data as *const _ as usize;
 
-    d_cs.copy_from_host(cs_flat)
-        .map_err(|e| anyhow::anyhow!("copy cs LDE: {e:?}"))?;
-    d_wires
-        .copy_from_host(wires_flat)
-        .map_err(|e| anyhow::anyhow!("copy wires LDE: {e:?}"))?;
-    d_zp.copy_from_host(zp_flat)
-        .map_err(|e| anyhow::anyhow!("copy zs/partial LDE: {e:?}"))?;
+    let mut cache_guard = QUOTIENT_GPU_CACHE.lock().unwrap();
+    let cache_needs_realloc = match cache_guard.as_ref() {
+        Some(c) => {
+            c.gpu_id != gpu_id
+                || c.cs_len != cs_flat.len()
+                || c.wires_len != wires_flat.len()
+                || c.zp_len != zp_flat.len()
+                || c.out_elems != out_elems
+        }
+        None => true,
+    };
+
+    if cache_needs_realloc {
+        *cache_guard = Some(QuotientGpuCache {
+            gpu_id,
+            common_ptr: 0,
+            cs_ptr: 0,
+            cs_len: cs_flat.len(),
+            wires_ptr: 0,
+            wires_len: wires_flat.len(),
+            zp_ptr: 0,
+            zp_len: zp_flat.len(),
+            d_cs: HostOrDeviceSlice::cuda_malloc(gpu_id as i32, cs_flat.len())
+                .map_err(|e| anyhow::anyhow!("cuda_malloc d_cs: {e:?}"))?,
+            d_wires: HostOrDeviceSlice::cuda_malloc(gpu_id as i32, wires_flat.len())
+                .map_err(|e| anyhow::anyhow!("cuda_malloc d_wires: {e:?}"))?,
+            d_zp: HostOrDeviceSlice::cuda_malloc(gpu_id as i32, zp_flat.len())
+                .map_err(|e| anyhow::anyhow!("cuda_malloc d_zp: {e:?}"))?,
+            d_out: HostOrDeviceSlice::cuda_malloc(gpu_id as i32, out_elems)
+                .map_err(|e| anyhow::anyhow!("cuda_malloc quotient out: {e:?}"))?,
+            host_out: vec![GoldilocksField::ZERO; out_elems],
+            gates: Vec::new(),
+            num_gates_u32: 0,
+            k_is_u64: Vec::new(),
+            betas_u64: vec![0; num_challenges],
+            gammas_u64: vec![0; num_challenges],
+            alphas_u64: vec![0; num_challenges],
+            out_elems,
+        });
+    }
+
+    let cache = cache_guard.as_mut().unwrap();
+
+    // Keep commitment leaves resident on device and refresh only if host backing changed.
+    if cache.cs_ptr != cs_ptr {
+        cache
+            .d_cs
+            .copy_from_host(cs_flat)
+            .map_err(|e| anyhow::anyhow!("copy cs LDE: {e:?}"))?;
+        cache.cs_ptr = cs_ptr;
+    }
+    if cache.wires_ptr != wires_ptr {
+        cache
+            .d_wires
+            .copy_from_host(wires_flat)
+            .map_err(|e| anyhow::anyhow!("copy wires LDE: {e:?}"))?;
+        cache.wires_ptr = wires_ptr;
+    }
+    if cache.zp_ptr != zp_ptr {
+        cache
+            .d_zp
+            .copy_from_host(zp_flat)
+            .map_err(|e| anyhow::anyhow!("copy zs/partial LDE: {e:?}"))?;
+        cache.zp_ptr = zp_ptr;
+    }
+    if cache.host_out.len() != out_elems {
+        cache.host_out.resize(out_elems, GoldilocksField::ZERO);
+    }
+    if cache.common_ptr != common_ptr {
+        cache.gates = zeknox_quotient_gate_infos(common_data);
+        cache.num_gates_u32 = cache.gates.len() as u32;
+        cache.k_is_u64 = common_data
+            .k_is
+            .iter()
+            .map(|x| x.to_canonical_u64())
+            .collect();
+        cache.common_ptr = common_ptr;
+    }
+    if cache.betas_u64.len() != num_challenges {
+        cache.betas_u64.resize(num_challenges, 0);
+        cache.gammas_u64.resize(num_challenges, 0);
+        cache.alphas_u64.resize(num_challenges, 0);
+    }
 
     let config = ProverConfig {
         degree_bits: common_data.degree_bits() as u32,
@@ -1027,49 +1134,46 @@ where
         num_public_inputs: common_data.num_public_inputs as u32,
     };
 
-    let gates = zeknox_quotient_gate_infos(common_data);
-    let (gates_ptr, num_gates_u32) = if gates.is_empty() {
+    let (gates_ptr, num_gates_u32) = if cache.gates.is_empty() {
         (core::ptr::null(), 0u32)
     } else {
-        (gates.as_ptr(), gates.len() as u32)
+        (cache.gates.as_ptr(), cache.num_gates_u32)
     };
 
     let public_inputs_hash_limbs =
         gpu_quotient_hash_limbs_gl64::<C::InnerHasher>(public_inputs_hash)?;
 
-    let k_is_u64: Vec<u64> = common_data
-        .k_is
-        .iter()
-        .map(|x| x.to_canonical_u64())
-        .collect();
-    let betas_u64: Vec<u64> = betas.iter().map(|x| x.to_canonical_u64()).collect();
-    let gammas_u64: Vec<u64> = gammas.iter().map(|x| x.to_canonical_u64()).collect();
-    let alphas_u64: Vec<u64> = alphas.iter().map(|x| x.to_canonical_u64()).collect();
+    for (dst, src) in cache.betas_u64.iter_mut().zip(betas.iter()) {
+        *dst = src.to_canonical_u64();
+    }
+    for (dst, src) in cache.gammas_u64.iter_mut().zip(gammas.iter()) {
+        *dst = src.to_canonical_u64();
+    }
+    for (dst, src) in cache.alphas_u64.iter_mut().zip(alphas.iter()) {
+        *dst = src.to_canonical_u64();
+    }
 
-    let out_elems = num_challenges * lde_q_expected;
-    let mut d_out = HostOrDeviceSlice::cuda_malloc(gpu_id as i32, out_elems)
-        .map_err(|e| anyhow::anyhow!("cuda_malloc quotient out: {e:?}"))?;
     let mut out_lde_q_size = lde_q_expected;
 
     unsafe {
         compute_quotient_polys_device_gl64(
             gpu_id,
             core::ptr::null_mut::<c_void>(),
-            d_cs.as_ptr() as *const u64,
+            cache.d_cs.as_ptr() as *const u64,
             cs_batch.merkle_tree.leaf_size as u64,
-            d_wires.as_ptr() as *const u64,
+            cache.d_wires.as_ptr() as *const u64,
             wires_commitment.merkle_tree.leaf_size as u64,
-            d_zp.as_ptr() as *const u64,
+            cache.d_zp.as_ptr() as *const u64,
             zs_partial_products_commitment.merkle_tree.leaf_size as u64,
             &config,
             gates_ptr,
             num_gates_u32,
-            k_is_u64.as_ptr(),
+            cache.k_is_u64.as_ptr(),
             public_inputs_hash_limbs.as_ptr(),
-            betas_u64.as_ptr(),
-            gammas_u64.as_ptr(),
-            alphas_u64.as_ptr(),
-            d_out.as_mut_ptr() as *mut u64,
+            cache.betas_u64.as_ptr(),
+            cache.gammas_u64.as_ptr(),
+            cache.alphas_u64.as_ptr(),
+            cache.d_out.as_mut_ptr() as *mut u64,
             &mut out_lde_q_size,
         )
         .map_err(|e| anyhow::anyhow!("compute_quotient_polys_device_gl64: {}", e))?;
@@ -1080,15 +1184,15 @@ where
         "unexpected quotient LDE size from device: got {out_lde_q_size}, expected {lde_q_expected}"
     );
 
-    let mut host_out = vec![GoldilocksField::ZERO; out_elems];
-    d_out
-        .copy_to_host(host_out.as_mut_slice(), out_elems)
+    cache
+        .d_out
+        .copy_to_host(cache.host_out.as_mut_slice(), out_elems)
         .map_err(|e| anyhow::anyhow!("copy quotient coeffs from device: {e:?}"))?;
 
     let out: Vec<PolynomialCoeffs<GoldilocksField>> = (0..num_challenges)
         .map(|c| {
             let start = c * lde_q_expected;
-            PolynomialCoeffs::new(host_out[start..start + lde_q_expected].to_vec())
+            PolynomialCoeffs::new(cache.host_out[start..start + lde_q_expected].to_vec())
         })
         .collect();
 
