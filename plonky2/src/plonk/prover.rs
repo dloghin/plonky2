@@ -2,21 +2,40 @@
 
 #[cfg(not(feature = "std"))]
 use alloc::{format, vec, vec::Vec};
+#[cfg(feature = "cuda")]
+use core::ffi::c_void;
 use core::mem::swap;
 
 use anyhow::{ensure, Result};
 use plonky2_maybe_rayon::*;
+#[cfg(feature = "cuda")]
+use zeknox::device::memory::HostOrDeviceSlice;
+#[cfg(feature = "cuda")]
+use zeknox::{
+    compute_quotient_polys_device_gl64, init_coset_rs, init_cuda_rs, init_twiddle_factors_rs,
+    GateInfo, ProverConfig,
+};
 
 use crate::field::extension::Extendable;
+#[cfg(feature = "cuda")]
+use crate::field::goldilocks_field::GoldilocksField;
 use crate::field::polynomial::{PolynomialCoeffs, PolynomialValues};
 use crate::field::types::Field;
+#[cfg(feature = "cuda")]
+use crate::field::types::PrimeField64;
 use crate::field::zero_poly_coset::ZeroPolyOnCoset;
 use crate::fri::oracle::PolynomialBatch;
+#[cfg(feature = "cuda")]
+use crate::gates::gate::GateRef;
 use crate::hash::hash_types::RichField;
+#[cfg(feature = "cuda")]
+use crate::hash::hash_types::NUM_HASH_OUT_ELTS;
 use crate::iop::challenger::Challenger;
 use crate::iop::generator::generate_partial_witness;
 use crate::iop::witness::{MatrixWitness, PartialWitness, PartitionWitness, Witness};
 use crate::plonk::circuit_data::{CommonCircuitData, ProverOnlyCircuitData};
+#[cfg(feature = "cuda")]
+use crate::plonk::config::GenericHashOut;
 use crate::plonk::config::{GenericConfig, Hasher};
 use crate::plonk::plonk_common::PlonkOracle;
 use crate::plonk::proof::{OpeningSet, Proof, ProofWithPublicInputs};
@@ -26,26 +45,6 @@ use crate::timed;
 use crate::util::partial_products::{partial_products_and_z_gx, quotient_chunk_products};
 use crate::util::timing::TimingTree;
 use crate::util::{ceil_div_usize, log2_ceil, transpose};
-
-#[cfg(feature = "cuda")]
-use core::ffi::c_void;
-#[cfg(feature = "cuda")]
-use crate::field::goldilocks_field::GoldilocksField;
-#[cfg(feature = "cuda")]
-use crate::field::types::PrimeField64;
-#[cfg(feature = "cuda")]
-use crate::gates::gate::GateRef;
-#[cfg(feature = "cuda")]
-use crate::hash::hash_types::NUM_HASH_OUT_ELTS;
-#[cfg(feature = "cuda")]
-use crate::plonk::config::GenericHashOut;
-#[cfg(feature = "cuda")]
-use zeknox::device::memory::HostOrDeviceSlice;
-#[cfg(feature = "cuda")]
-use zeknox::{
-    compute_quotient_polys_device_gl64, GateInfo, ProverConfig, init_coset_rs, init_cuda_rs,
-    init_twiddle_factors_rs,
-};
 
 /// Set all the lookup gate wires (including multiplicities) and pad unused LU slots.
 /// Warning: rows are in descending order: the first gate to appear is the last LU gate, and
@@ -872,14 +871,12 @@ where
     let mut d_zp = HostOrDeviceSlice::cuda_malloc(gpu_id as i32, zp_flat.len())
         .map_err(|e| anyhow::anyhow!("cuda_malloc d_zp: {e:?}"))?;
 
-    d_cs
-        .copy_from_host(cs_flat)
+    d_cs.copy_from_host(cs_flat)
         .map_err(|e| anyhow::anyhow!("copy cs LDE: {e:?}"))?;
     d_wires
         .copy_from_host(wires_flat)
         .map_err(|e| anyhow::anyhow!("copy wires LDE: {e:?}"))?;
-    d_zp
-        .copy_from_host(zp_flat)
+    d_zp.copy_from_host(zp_flat)
         .map_err(|e| anyhow::anyhow!("copy zs/partial LDE: {e:?}"))?;
 
     let config = ProverConfig {
