@@ -482,7 +482,7 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
                             .unwrap();
 
                     let start = std::time::Instant::now();
-                    lde_batch::<F>(
+                    let _ = lde_batch::<F>(
                         id,
                         device_output_data.as_mut_ptr(),
                         device_input_data.read().unwrap().as_ptr(),
