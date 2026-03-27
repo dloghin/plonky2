@@ -12,12 +12,11 @@ use plonky2_maybe_rayon::*;
 use zeknox::device::memory::HostOrDeviceSlice;
 #[cfg(feature = "cuda")]
 use zeknox::{
-    compute_quotient_polys_device_gl64, init_coset_rs, init_cuda_rs, init_twiddle_factors_rs,
+    compute_quotient_polys_device_gl64,
     GateInfo, ProverConfig,
 };
 
 use crate::field::extension::Extendable;
-#[cfg(feature = "cuda")]
 use crate::field::goldilocks_field::GoldilocksField;
 use crate::field::polynomial::{PolynomialCoeffs, PolynomialValues};
 use crate::field::types::Field;
@@ -386,6 +385,166 @@ where
         proof,
         public_inputs,
     })
+}
+
+/// Precomputed inputs used to benchmark quotient polynomial computation in isolation.
+#[derive(Debug)]
+pub struct QuotientPolysBenchInputs<C: GenericConfig<D, F = GoldilocksField>, const D: usize>
+where
+    GoldilocksField: Extendable<D>,
+{
+    pub public_inputs_hash: <<C as GenericConfig<D>>::InnerHasher as Hasher<GoldilocksField>>::Hash,
+    pub wires_commitment: PolynomialBatch<GoldilocksField, C, D>,
+    pub zs_partial_products_commitment: PolynomialBatch<GoldilocksField, C, D>,
+    pub betas: Vec<GoldilocksField>,
+    pub gammas: Vec<GoldilocksField>,
+    pub alphas: Vec<GoldilocksField>,
+}
+
+/// Build all inputs required by quotient polynomial computation.
+///
+/// This mirrors the prover flow up to challenge sampling for `alphas`, so benchmarks can focus on
+/// quotient-polynomial work itself.
+pub fn prepare_quotient_polys_bench_inputs<
+    C: GenericConfig<D, F = GoldilocksField>,
+    const D: usize,
+>(
+    prover_data: &ProverOnlyCircuitData<GoldilocksField, C, D>,
+    common_data: &CommonCircuitData<GoldilocksField, D>,
+    partition_witness: PartitionWitness<GoldilocksField>,
+    timing: &mut TimingTree,
+) -> QuotientPolysBenchInputs<C, D>
+where
+    GoldilocksField: Extendable<D>,
+    C::Hasher: Hasher<GoldilocksField>,
+    C::InnerHasher: Hasher<GoldilocksField>,
+{
+    let config = &common_data.config;
+    let num_challenges = config.num_challenges;
+
+    let public_inputs = partition_witness.get_targets(&prover_data.public_inputs);
+    let public_inputs_hash = C::InnerHasher::hash_public_inputs(&public_inputs);
+
+    let witness = timed!(
+        timing,
+        "bench compute full witness",
+        partition_witness.full_witness()
+    );
+
+    let wires_values: Vec<PolynomialValues<GoldilocksField>> = timed!(
+        timing,
+        "bench compute wire polynomials",
+        witness
+            .wire_values
+            .par_iter()
+            .map(|column| PolynomialValues::new(column.clone()))
+            .collect()
+    );
+
+    let wires_commitment = timed!(
+        timing,
+        "bench compute wires commitment",
+        PolynomialBatch::<GoldilocksField, C, D>::from_values(
+            wires_values,
+            config.fri_config.rate_bits,
+            config.zero_knowledge && PlonkOracle::WIRES.blinding,
+            config.fri_config.cap_height,
+            timing,
+            prover_data.fft_root_table.as_ref(),
+        )
+    );
+
+    let mut challenger = Challenger::<GoldilocksField, C::Hasher>::new();
+    challenger.observe_hash::<C::Hasher>(prover_data.circuit_digest);
+    challenger.observe_hash::<C::InnerHasher>(public_inputs_hash);
+    challenger.observe_cap::<C::Hasher>(&wires_commitment.merkle_tree.cap);
+
+    let betas = challenger.get_n_challenges(num_challenges);
+    let gammas = challenger.get_n_challenges(num_challenges);
+
+    let mut partial_products_and_zs = timed!(
+        timing,
+        "bench compute partial products",
+        all_wires_permutation_partial_products(&witness, &betas, &gammas, prover_data, common_data)
+    );
+
+    let plonk_z_vecs = partial_products_and_zs
+        .iter_mut()
+        .map(|partial_products_and_z| partial_products_and_z.pop().unwrap())
+        .collect();
+    let zs_partial_products = [plonk_z_vecs, partial_products_and_zs.concat()].concat();
+
+    let zs_partial_products_commitment = timed!(
+        timing,
+        "bench commit to partial products and Zs",
+        PolynomialBatch::from_values(
+            zs_partial_products,
+            config.fri_config.rate_bits,
+            config.zero_knowledge && PlonkOracle::ZS_PARTIAL_PRODUCTS.blinding,
+            config.fri_config.cap_height,
+            timing,
+            prover_data.fft_root_table.as_ref(),
+        )
+    );
+
+    challenger.observe_cap::<C::Hasher>(&zs_partial_products_commitment.merkle_tree.cap);
+    let alphas = challenger.get_n_challenges(num_challenges);
+
+    QuotientPolysBenchInputs {
+        public_inputs_hash,
+        wires_commitment,
+        zs_partial_products_commitment,
+        betas,
+        gammas,
+        alphas,
+    }
+}
+
+/// Benchmark-facing quotient computation entrypoint.
+///
+/// With `feature = "cuda"`, this uses the GPU-backed quotient implementation.
+/// Without `cuda`, it uses the CPU implementation.
+pub fn compute_quotient_polys_for_bench<
+    'a,
+    C: GenericConfig<D, F = GoldilocksField>,
+    const D: usize,
+>(
+    common_data: &CommonCircuitData<GoldilocksField, D>,
+    prover_data: &'a ProverOnlyCircuitData<GoldilocksField, C, D>,
+    inputs: &'a QuotientPolysBenchInputs<C, D>,
+) -> anyhow::Result<Vec<PolynomialCoeffs<GoldilocksField>>>
+where
+    GoldilocksField: Extendable<D>,
+    C::Hasher: Hasher<GoldilocksField>,
+    C::InnerHasher: Hasher<GoldilocksField>,
+{
+    #[cfg(feature = "cuda")]
+    {
+        return compute_quotient_polys_gpu_gl64(
+            common_data,
+            prover_data,
+            &inputs.public_inputs_hash,
+            &inputs.wires_commitment,
+            &inputs.zs_partial_products_commitment,
+            &inputs.betas,
+            &inputs.gammas,
+            &inputs.alphas,
+        );
+    }
+
+    #[cfg(not(feature = "cuda"))]
+    {
+        Ok(compute_quotient_polys(
+            common_data,
+            prover_data,
+            &inputs.public_inputs_hash,
+            &inputs.wires_commitment,
+            &inputs.zs_partial_products_commitment,
+            &inputs.betas,
+            &inputs.gammas,
+            &inputs.alphas,
+        ))
+    }
 }
 
 /// Compute the partial products used in the `Z` polynomials.
@@ -820,33 +979,8 @@ where
     );
 
     let lde_q_expected = 1usize << (common_data.degree_bits() + quotient_degree_bits);
-    let lg_ntt_domain = common_data.degree_bits() + common_data.config.fri_config.rate_bits;
 
-    init_cuda_rs();
-    let num_gpus: usize = std::env::var("NUM_OF_GPUS")
-        .map_err(|_| anyhow::anyhow!("NUM_OF_GPUS must be set for CUDA quotient"))?
-        .parse()
-        .map_err(|_| anyhow::anyhow!("NUM_OF_GPUS must be a valid usize"))?;
-    ensure!(num_gpus > 0, "NUM_OF_GPUS must be positive");
-
-    let gpu_id = {
-        let mut gpu_id_lock = crate::fri::oracle::GPU_ID.lock().unwrap();
-        let id = *gpu_id_lock;
-        *gpu_id_lock += 1;
-        if *gpu_id_lock >= num_gpus {
-            *gpu_id_lock = 0;
-        }
-        id
-    };
-
-    init_twiddle_factors_rs(gpu_id, lg_ntt_domain)
-        .map_err(|e| anyhow::anyhow!("init_twiddle_factors_rs: {e}"))?;
-    init_coset_rs(
-        gpu_id,
-        lg_ntt_domain,
-        GoldilocksField::coset_shift().to_canonical_u64(),
-    )
-    .map_err(|e| anyhow::anyhow!("init_coset_rs: {e}"))?;
+    let gpu_id = 0;
 
     let cs_batch = &prover_data.constants_sigmas_commitment;
     ensure!(
