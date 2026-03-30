@@ -5,20 +5,17 @@ use alloc::{format, vec, vec::Vec};
 #[cfg(feature = "cuda")]
 use core::ffi::c_void;
 use core::mem::swap;
+#[cfg(feature = "cuda")]
+use std::sync::Mutex;
 
 use anyhow::{ensure, Result};
 #[cfg(feature = "cuda")]
 use once_cell::sync::Lazy;
 use plonky2_maybe_rayon::*;
 #[cfg(feature = "cuda")]
-use std::sync::Mutex;
-#[cfg(feature = "cuda")]
 use zeknox::device::memory::HostOrDeviceSlice;
 #[cfg(feature = "cuda")]
-use zeknox::{
-    compute_quotient_polys_device_gl64,
-    GateInfo, ProverConfig,
-};
+use zeknox::{compute_quotient_polys_device_gl64, GateInfo, ProverConfig};
 
 use crate::field::extension::Extendable;
 use crate::field::goldilocks_field::GoldilocksField;
