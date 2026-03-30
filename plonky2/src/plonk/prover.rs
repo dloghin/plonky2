@@ -24,8 +24,6 @@ use crate::field::extension::Extendable;
 use crate::field::goldilocks_field::GoldilocksField;
 use crate::field::polynomial::{PolynomialCoeffs, PolynomialValues};
 use crate::field::types::Field;
-#[cfg(feature = "cuda")]
-use crate::field::types::PrimeField64;
 use crate::field::zero_poly_coset::ZeroPolyOnCoset;
 use crate::fri::oracle::PolynomialBatch;
 #[cfg(feature = "cuda")]
@@ -311,7 +309,7 @@ where
             // &deltas,
             &alphas,
         )
-    );
+    )?;
     #[cfg(not(feature = "cuda"))]
     let quotient_polys = timed!(
         timing,
@@ -971,31 +969,48 @@ fn compute_quotient_polys<
 }
 
 /// Same role as [`compute_quotient_polys`], but evaluates the quotient pipeline on a CUDA device
-/// via Zeknox [`compute_quotient_polys_device_gl64`](zeknox::compute_quotient_polys_device_gl64).
+/// via Zeknox [`compute_quotient_polys_device_gl64`](zeknox::compute_quotient_polys_device_gl64)
+/// when the base field `F` is [`GoldilocksField`] (checked at runtime with [`TypeId`](core::any::TypeId)).
 ///
-/// Requires `feature = "cuda"`, `NUM_OF_GPUS`, and a **Goldilocks** base field (`C::F` must be
-/// [`GoldilocksField`]). Uploads the committed LDE leaves from each oracle’s Merkle tree (same layout
-/// as the native gather kernel: bit-reversed coset LDE rows).
+/// If `F` is not Goldilocks, this delegates to [`compute_quotient_polys`] on the CPU.
+///
+/// Requires `feature = "cuda"` and `NUM_OF_GPUS` for the GPU path. Uploads the committed LDE leaves
+/// from each oracle’s Merkle tree (same layout as the native gather kernel: bit-reversed coset LDE rows).
 #[cfg(feature = "cuda")]
 pub fn compute_quotient_polys_gpu_gl64<
     'a,
-    C: GenericConfig<D, F = GoldilocksField>,
+    F: RichField + Extendable<D>,
+    C: GenericConfig<D, F = F>,
     const D: usize,
 >(
-    common_data: &CommonCircuitData<GoldilocksField, D>,
-    prover_data: &'a ProverOnlyCircuitData<GoldilocksField, C, D>,
-    public_inputs_hash: &<<C as GenericConfig<D>>::InnerHasher as Hasher<GoldilocksField>>::Hash,
-    wires_commitment: &'a PolynomialBatch<GoldilocksField, C, D>,
-    zs_partial_products_commitment: &'a PolynomialBatch<GoldilocksField, C, D>,
-    betas: &[GoldilocksField],
-    gammas: &[GoldilocksField],
-    alphas: &[GoldilocksField],
-) -> anyhow::Result<Vec<PolynomialCoeffs<GoldilocksField>>>
+    common_data: &CommonCircuitData<F, D>,
+    prover_data: &'a ProverOnlyCircuitData<F, C, D>,
+    public_inputs_hash: &<<C as GenericConfig<D>>::InnerHasher as Hasher<F>>::Hash,
+    wires_commitment: &'a PolynomialBatch<F, C, D>,
+    zs_partial_products_commitment: &'a PolynomialBatch<F, C, D>,
+    betas: &[F],
+    gammas: &[F],
+    alphas: &[F],
+) -> anyhow::Result<Vec<PolynomialCoeffs<F>>>
 where
-    GoldilocksField: Extendable<D>,
-    C::Hasher: Hasher<GoldilocksField>,
-    C::InnerHasher: Hasher<GoldilocksField>,
+    C::Hasher: Hasher<F>,
+    C::InnerHasher: Hasher<F>,
 {
+    use core::any::TypeId;
+
+    if TypeId::of::<F>() != TypeId::of::<GoldilocksField>() {
+        return Ok(compute_quotient_polys(
+            common_data,
+            prover_data,
+            public_inputs_hash,
+            wires_commitment,
+            zs_partial_products_commitment,
+            betas,
+            gammas,
+            alphas,
+        ));
+    }
+
     let num_challenges = common_data.config.num_challenges;
     ensure!(
         betas.len() == num_challenges
@@ -1081,23 +1096,35 @@ where
 
     // Keep commitment leaves resident on device and refresh only if host backing changed.
     if cache.cs_ptr != cs_ptr {
+        let cs_flat_gl: &[GoldilocksField] = unsafe {
+            // SAFETY: GPU path only runs when `F` is `GoldilocksField` — see `TypeId` check above.
+            core::mem::transmute(cs_flat)
+        };
         cache
             .d_cs
-            .copy_from_host(cs_flat)
+            .copy_from_host(cs_flat_gl)
             .map_err(|e| anyhow::anyhow!("copy cs LDE: {e:?}"))?;
         cache.cs_ptr = cs_ptr;
     }
     if cache.wires_ptr != wires_ptr {
+        let wires_flat_gl: &[GoldilocksField] = unsafe {
+            // SAFETY: same as `cs_flat_gl`.
+            core::mem::transmute(wires_flat)
+        };
         cache
             .d_wires
-            .copy_from_host(wires_flat)
+            .copy_from_host(wires_flat_gl)
             .map_err(|e| anyhow::anyhow!("copy wires LDE: {e:?}"))?;
         cache.wires_ptr = wires_ptr;
     }
     if cache.zp_ptr != zp_ptr {
+        let zp_flat_gl: &[GoldilocksField] = unsafe {
+            // SAFETY: same as `cs_flat_gl`.
+            core::mem::transmute(zp_flat)
+        };
         cache
             .d_zp
-            .copy_from_host(zp_flat)
+            .copy_from_host(zp_flat_gl)
             .map_err(|e| anyhow::anyhow!("copy zs/partial LDE: {e:?}"))?;
         cache.zp_ptr = zp_ptr;
     }
@@ -1141,7 +1168,7 @@ where
     };
 
     let public_inputs_hash_limbs =
-        gpu_quotient_hash_limbs_gl64::<C::InnerHasher>(public_inputs_hash)?;
+        gpu_quotient_hash_limbs::<F, C::InnerHasher>(public_inputs_hash)?;
 
     for (dst, src) in cache.betas_u64.iter_mut().zip(betas.iter()) {
         *dst = src.to_canonical_u64();
@@ -1189,10 +1216,16 @@ where
         .copy_to_host(cache.host_out.as_mut_slice(), out_elems)
         .map_err(|e| anyhow::anyhow!("copy quotient coeffs from device: {e:?}"))?;
 
-    let out: Vec<PolynomialCoeffs<GoldilocksField>> = (0..num_challenges)
+    let out: Vec<PolynomialCoeffs<F>> = (0..num_challenges)
         .map(|c| {
             let start = c * lde_q_expected;
-            PolynomialCoeffs::new(cache.host_out[start..start + lde_q_expected].to_vec())
+            let chunk: Vec<GoldilocksField> =
+                cache.host_out[start..start + lde_q_expected].to_vec();
+            let chunk_f: Vec<F> = unsafe {
+                // SAFETY: GPU path only runs when `F` is `GoldilocksField` — see `TypeId` check above.
+                core::mem::transmute(chunk)
+            };
+            PolynomialCoeffs::new(chunk_f)
         })
         .collect();
 
@@ -1220,8 +1253,12 @@ fn compute_quotient_polys_gpu<
     gammas: &[F],
     // deltas: &[F],
     alphas: &[F],
-) -> Vec<PolynomialCoeffs<F>> {
-    compute_quotient_polys(
+) -> Result<Vec<PolynomialCoeffs<F>>>
+where
+    C::Hasher: Hasher<F>,
+    C::InnerHasher: Hasher<F>,
+{
+    compute_quotient_polys_gpu_gl64(
         common_data,
         prover_data,
         public_inputs_hash,
@@ -1234,7 +1271,7 @@ fn compute_quotient_polys_gpu<
 }
 
 #[cfg(feature = "cuda")]
-fn gpu_quotient_hash_limbs_gl64<H: Hasher<GoldilocksField>>(
+fn gpu_quotient_hash_limbs<F: RichField, H: Hasher<F>>(
     hash: &H::Hash,
 ) -> anyhow::Result<[u64; NUM_HASH_OUT_ELTS]> {
     let v = hash.to_vec();
@@ -1249,10 +1286,9 @@ fn gpu_quotient_hash_limbs_gl64<H: Hasher<GoldilocksField>>(
 }
 
 #[cfg(feature = "cuda")]
-fn zeknox_quotient_gate_type_id<const D: usize>(gate: &GateRef<GoldilocksField, D>) -> u32
-where
-    GoldilocksField: Extendable<D>,
-{
+fn zeknox_quotient_gate_type_id<F: RichField + Extendable<D>, const D: usize>(
+    gate: &GateRef<F, D>,
+) -> u32 {
     let id = gate.0.id();
     let head = id
         .split(|c| c == ' ' || c == '{' || c == '(')
@@ -1285,12 +1321,9 @@ fn parse_gate_named_u32(id: &str, key: &str) -> Option<u32> {
 }
 
 #[cfg(feature = "cuda")]
-fn zeknox_quotient_gate_infos<const D: usize>(
-    common: &CommonCircuitData<GoldilocksField, D>,
-) -> Vec<GateInfo>
-where
-    GoldilocksField: Extendable<D>,
-{
+fn zeknox_quotient_gate_infos<F: RichField + Extendable<D>, const D: usize>(
+    common: &CommonCircuitData<F, D>,
+) -> Vec<GateInfo> {
     let num_sel = common.selectors_info.num_selectors() as u32;
     common
         .gates
