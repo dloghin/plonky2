@@ -45,9 +45,6 @@ fn print_time(now: Instant, msg: &str) {
 #[cfg(not(feature = "cuda_timing"))]
 fn print_time(_now: Instant, _msg: &str) {}
 
-#[cfg(feature = "cuda")]
-const FORCE_SINGLE_GPU: bool = true;
-
 /// The Merkle cap of height `h` of a Merkle tree is the `h`-th layer (from the root) of the tree.
 /// It can be used in place of the root to verify Merkle paths, which are `h` elements shorter.
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -476,13 +473,16 @@ fn fill_digests_buf_gpu_ptr<F: RichField, H: Hasher<F>>(
             .expect("NUM_OF_GPUS should be set")
             .parse()
             .unwrap();
-        if !FORCE_SINGLE_GPU
+        let force_single_gpu: bool = std::env::var("FORCE_SINGLE_GPU")
+            .unwrap_or("false".to_string())
+            .parse()
+            .unwrap();
+        if !force_single_gpu
             && leaves_count >= (1 << 12)
             && cap_height > 0
             && num_gpus > 1
             && H::HASHER_TYPE == HasherType::PoseidonBN128
         {
-            // println!("Multi GPU");
             fill_digests_buf_linear_multigpu_with_gpu_ptr(
                 gpu_digests_buf.as_mut_ptr() as *mut core::ffi::c_void,
                 gpu_cap_buf.as_mut_ptr() as *mut core::ffi::c_void,
@@ -493,9 +493,9 @@ fn fill_digests_buf_gpu_ptr<F: RichField, H: Hasher<F>>(
                 leaf_size,
                 cap_height,
                 H::HASHER_TYPE as u64,
+                gpu_id,
             );
         } else {
-            // println!("Single GPU");
             fill_digests_buf_linear_gpu_with_gpu_ptr(
                 gpu_digests_buf.as_mut_ptr() as *mut core::ffi::c_void,
                 gpu_cap_buf.as_mut_ptr() as *mut core::ffi::c_void,
@@ -605,7 +605,10 @@ fn fill_digests_buf_meta<F: RichField, H: Hasher<F>>(
     fill_digests_buf::<F, H>(digests_buf, cap_buf, leaves, leaf_size, cap_height);
 }
 
-#[cfg(all(target_feature = "avx2", target_feature = "avx512dq"))]
+#[cfg(all(
+    not(feature = "cuda"),
+    all(target_feature = "avx2", target_feature = "avx512dq")
+))]
 fn fill_digests_buf_meta<F: RichField, H: Hasher<F>>(
     digests_buf: &mut [MaybeUninit<H::Hash>],
     cap_buf: &mut [MaybeUninit<H::Hash>],
@@ -657,16 +660,6 @@ impl<F: RichField, H: Hasher<F>> MerkleTree<F, H> {
             digests.set_len(num_digests);
             cap.set_len(len_cap);
         }
-        /*
-        println!{"Digest Buffer"};
-        for dg in &digests {
-            println!("{:?}", dg);
-        }
-        println!{"Cap Buffer"};
-        for dg in &cap {
-            println!("{:?}", dg);
-        }
-        */
         Self {
             leaves: leaves_1d,
             leaf_size,
@@ -706,6 +699,7 @@ impl<F: RichField, H: Hasher<F>> MerkleTree<F, H> {
 
     #[cfg(feature = "cuda")]
     pub fn new_from_gpu_leaves(
+        gpu_id: usize,
         leaves_gpu_ptr: &HostOrDeviceSlice<'_, F>,
         leaves_len: usize,
         leaf_len: usize,
@@ -748,7 +742,6 @@ impl<F: RichField, H: Hasher<F>> MerkleTree<F, H> {
         let digests_buf = capacity_up_to_mut(&mut digests, num_digests);
         let cap_buf = capacity_up_to_mut(&mut cap, len_cap);
         let now = Instant::now();
-        let gpu_id = 0;
         fill_digests_buf_gpu_ptr::<F, H>(
             digests_buf,
             cap_buf,
@@ -756,7 +749,7 @@ impl<F: RichField, H: Hasher<F>> MerkleTree<F, H> {
             leaves_len,
             leaf_len,
             cap_height,
-            gpu_id,
+            gpu_id as u64,
         );
         print_time(now, "fill digests buffer");
 
@@ -766,16 +759,6 @@ impl<F: RichField, H: Hasher<F>> MerkleTree<F, H> {
             digests.set_len(num_digests);
             cap.set_len(len_cap);
         }
-        /*
-        println!{"Digest Buffer"};
-        for dg in &digests {
-            println!("{:?}", dg);
-        }
-        println!{"Cap Buffer"};
-        for dg in &cap {
-            println!("{:?}", dg);
-        }
-        */
         let _ = stream_copy.synchronize();
         let _ = stream_copy.destroy();
 
@@ -791,6 +774,11 @@ impl<F: RichField, H: Hasher<F>> MerkleTree<F, H> {
         let (_, v) = self.leaves.split_at(i * self.leaf_size);
         let (v, _) = v.split_at(self.leaf_size);
         v
+    }
+
+    /// Contiguous leaf buffer in Merkle order (`get_leaves_count() * leaf_size` scalars).
+    pub fn leaves_flat(&self) -> &[F] {
+        &self.leaves
     }
 
     pub fn get_leaves_1d(&self) -> Vec<F> {
@@ -1068,21 +1056,6 @@ mod tests {
         let mt2 = MerkleTree::<F, <C as GenericConfig<D>>::Hasher>::new_from_2d(leaves, cap_h);
 
         mt1.change_leaf_and_update(tmp[0].clone(), 0);
-
-        /*
-        println!("Tree 1");
-        mt1.digests.into_iter().for_each(
-            |x| {
-                println!("{:?}", x);
-            }
-        );
-        println!("Tree 2");
-        mt2.digests.into_iter().for_each(
-            |x| {
-                println!("{:?}", x);
-            }
-        );
-        */
 
         mt1.digests
             .into_par_iter()
@@ -1364,13 +1337,26 @@ mod tests {
         let leaves = random_data_2d::<F>(n, 7);
         let leaves_1d: Vec<F> = leaves.into_iter().flatten().collect();
 
-        let mut gpu_data: HostOrDeviceSlice<'_, F> =
-            HostOrDeviceSlice::cuda_malloc(0, n * 7).unwrap();
-        gpu_data
-            .copy_from_host(leaves_1d.as_slice())
-            .expect("copy data to gpu");
+        let num_gpus: usize = std::env::var("NUM_OF_GPUS")
+            .expect("NUM_OF_GPUS should be set")
+            .parse()
+            .unwrap();
 
-        MerkleTree::<F, <C as GenericConfig<D>>::Hasher>::new_from_gpu_leaves(&gpu_data, n, 7, 1);
+        for gpu_id in 0..num_gpus {
+            let mut gpu_data: HostOrDeviceSlice<'_, F> =
+                HostOrDeviceSlice::cuda_malloc(gpu_id as i32, n * 7).unwrap();
+            gpu_data
+                .copy_from_host(leaves_1d.as_slice())
+                .expect("copy data to gpu");
+
+            MerkleTree::<F, <C as GenericConfig<D>>::Hasher>::new_from_gpu_leaves(
+                gpu_id as usize,
+                &gpu_data,
+                n,
+                7,
+                1,
+            );
+        }
 
         Ok(())
     }

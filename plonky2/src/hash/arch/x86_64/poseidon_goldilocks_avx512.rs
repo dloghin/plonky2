@@ -1290,7 +1290,7 @@ pub unsafe fn mul64_no_overflow_avx512(a: &__m512i, b: &__m512i) -> __m512i {
     r
     */
     // short version
-    _mm512_mullo_epi64(*a, *b)
+    _mm512_mullox_epi64(*a, *b)
 }
 
 #[inline(always)]
