@@ -483,7 +483,6 @@ fn fill_digests_buf_gpu_ptr<F: RichField, H: Hasher<F>>(
             && num_gpus > 1
             && H::HASHER_TYPE == HasherType::PoseidonBN128
         {
-            // println!("fill_digests_buf_gpu_ptr(): Multi GPU");
             fill_digests_buf_linear_multigpu_with_gpu_ptr(
                 gpu_digests_buf.as_mut_ptr() as *mut core::ffi::c_void,
                 gpu_cap_buf.as_mut_ptr() as *mut core::ffi::c_void,
@@ -497,7 +496,6 @@ fn fill_digests_buf_gpu_ptr<F: RichField, H: Hasher<F>>(
                 gpu_id,
             );
         } else {
-            // println!("fill_digests_buf_gpu_ptr(): Single GPU");
             fill_digests_buf_linear_gpu_with_gpu_ptr(
                 gpu_digests_buf.as_mut_ptr() as *mut core::ffi::c_void,
                 gpu_cap_buf.as_mut_ptr() as *mut core::ffi::c_void,
@@ -662,16 +660,6 @@ impl<F: RichField, H: Hasher<F>> MerkleTree<F, H> {
             digests.set_len(num_digests);
             cap.set_len(len_cap);
         }
-        /*
-        println!{"Digest Buffer"};
-        for dg in &digests {
-            println!("{:?}", dg);
-        }
-        println!{"Cap Buffer"};
-        for dg in &cap {
-            println!("{:?}", dg);
-        }
-        */
         Self {
             leaves: leaves_1d,
             leaf_size,
@@ -771,16 +759,6 @@ impl<F: RichField, H: Hasher<F>> MerkleTree<F, H> {
             digests.set_len(num_digests);
             cap.set_len(len_cap);
         }
-        /*
-        println!{"Digest Buffer"};
-        for dg in &digests {
-            println!("{:?}", dg);
-        }
-        println!{"Cap Buffer"};
-        for dg in &cap {
-            println!("{:?}", dg);
-        }
-        */
         let _ = stream_copy.synchronize();
         let _ = stream_copy.destroy();
 
@@ -1078,21 +1056,6 @@ mod tests {
         let mt2 = MerkleTree::<F, <C as GenericConfig<D>>::Hasher>::new_from_2d(leaves, cap_h);
 
         mt1.change_leaf_and_update(tmp[0].clone(), 0);
-
-        /*
-        println!("Tree 1");
-        mt1.digests.into_iter().for_each(
-            |x| {
-                println!("{:?}", x);
-            }
-        );
-        println!("Tree 2");
-        mt2.digests.into_iter().for_each(
-            |x| {
-                println!("{:?}", x);
-            }
-        );
-        */
 
         mt1.digests
             .into_par_iter()
